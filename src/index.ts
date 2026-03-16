@@ -8,4 +8,6 @@ export type {
   GroupOptions,
   SluiceEvents,
 } from "./types.js";
+export { RedisConnection } from "./redis/index.js";
+export type { RedisConnectionOptions, RedisClient } from "./redis/index.js";
 export default Sluice;
