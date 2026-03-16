@@ -1,0 +1,52 @@
+{
+  "name": "@agentine/sluice",
+  "version": "0.1.0",
+  "description": "Task scheduler and rate limiter for Node.js — drop-in replacement for bottleneck",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentine/sluice.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./compat/bottleneck": {
+      "types": "./dist/esm/compat/bottleneck.d.ts",
+      "import": "./dist/esm/compat/bottleneck.js",
+      "require": "./dist/cjs/compat/bottleneck.js"
+    }
+  },
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "npm run build:esm && npm run build:cjs",
+    "build:esm": "tsc -p tsconfig.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  },
+  "peerDependencies": {
+    "ioredis": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    }
+  }
+}
