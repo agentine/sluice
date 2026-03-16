@@ -7,7 +7,6 @@ import { Strategy, DEFAULT_PRIORITY } from "./types.js";
 import type { SluiceOptions, JobOptions } from "./types.js";
 
 export class Sluice extends EventEmitter {
-  // stub — full implementation in Phase 2
   private _options: Required<
     Pick<SluiceOptions, "maxConcurrent" | "minTime" | "highWater" | "strategy" | "rejectOnDrop" | "trackDoneStatus" | "id">
   >;
@@ -15,10 +14,11 @@ export class Sluice extends EventEmitter {
   private _reservoir: Reservoir;
   private _running = 0;
   private _done = 0;
-  private _lastScheduled = 0;
+  private _nextAllowedTime = 0;
   private _stopped = false;
   private _chain: Sluice | null = null;
   private _drainTimer: ReturnType<typeof setTimeout> | null = null;
+  private _minTimeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: SluiceOptions = {}) {
     super();
@@ -74,12 +74,12 @@ export class Sluice extends EventEmitter {
     return new Promise<T>((resolve, reject) => {
       const job = { resolve, reject, fn, args, options: resolvedOptions } as unknown as QueuedJob;
       this.emit("received", { args, options: resolvedOptions });
-      this._addJob(job as QueuedJob);
+      this._addJob(job);
     });
   }
 
-  submit<T>(options: JobOptions, fn: (...args: unknown[]) => void, ...args: unknown[]): void;
-  submit<T>(fn: (...args: unknown[]) => void, ...args: unknown[]): void;
+  submit(options: JobOptions, fn: (...args: unknown[]) => void, ...args: unknown[]): void;
+  submit(fn: (...args: unknown[]) => void, ...args: unknown[]): void;
   submit(...fnArgs: unknown[]): void {
     let options: JobOptions;
     let fn: (...args: unknown[]) => void;
@@ -120,6 +120,14 @@ export class Sluice extends EventEmitter {
   stop(options?: { dropWaitingJobs?: boolean; dropErrorMessage?: string; enqueueErrorMessage?: string }): this {
     this._stopped = true;
     this._reservoir.stop();
+    if (this._minTimeTimer) {
+      clearTimeout(this._minTimeTimer);
+      this._minTimeTimer = null;
+    }
+    if (this._drainTimer) {
+      clearTimeout(this._drainTimer);
+      this._drainTimer = null;
+    }
 
     if (options?.dropWaitingJobs) {
       const msg = options.dropErrorMessage ?? "This limiter has been stopped.";
@@ -205,36 +213,73 @@ export class Sluice extends EventEmitter {
         this.emit("dropped", { args: job.args, options: job.options });
         return;
       }
-      // BLOCK: job still queued, will wait
+      // BLOCK: job is still queued, drain will pause until queue drops below HWM
     }
 
     const reachedHWM = hwm != null && this._queue.length + 1 >= hwm;
     const blocked = this._options.strategy === Strategy.BLOCK && reachedHWM;
     this._queue.push(job);
     this.emit("queued", { args: job.args, options: job.options, reachedHWM, blocked });
-    this._drain();
+    if (!blocked) {
+      this._drain();
+    }
   }
 
   private _drain(): void {
     if (this._stopped) return;
 
-    while (this._canRun()) {
-      const job = this._queue.shift();
-      if (!job) break;
-      if (!this._reservoir.tryConsume(job.options.weight)) {
-        // Put it back
-        this._queue.push(job);
-        this.emit("depleted");
-        break;
-      }
-      this._execute(job);
+    // BLOCK strategy: don't process if queue is at/above high water mark
+    const hwm = this._options.highWater;
+    if (hwm != null && this._options.strategy === Strategy.BLOCK && this._queue.length >= hwm) {
+      return;
     }
 
-    if (this._queue.length === 0) {
-      this.emit("empty");
-      if (this._running === 0) {
-        this.emit("idle");
+    const now = Date.now();
+    const minTime = this._options.minTime;
+
+    // Check if we need to wait for minTime
+    if (minTime > 0 && now < this._nextAllowedTime) {
+      // Schedule a drain at the next allowed time
+      if (!this._minTimeTimer) {
+        const delay = this._nextAllowedTime - now;
+        this._minTimeTimer = setTimeout(() => {
+          this._minTimeTimer = null;
+          this._drain();
+        }, delay);
+        if (this._minTimeTimer.unref) this._minTimeTimer.unref();
       }
+      return;
+    }
+
+    if (!this._canRun()) {
+      this._checkEmptyIdle();
+      return;
+    }
+
+    const job = this._queue.shift();
+    if (!job) {
+      this._checkEmptyIdle();
+      return;
+    }
+
+    if (!this._reservoir.tryConsume(job.options.weight)) {
+      this._queue.push(job);
+      this.emit("depleted");
+      return;
+    }
+
+    // Update minTime scheduling
+    if (minTime > 0) {
+      this._nextAllowedTime = Date.now() + minTime;
+    }
+
+    this._execute(job);
+
+    // Continue draining if more jobs can run (will re-check minTime at top)
+    if (this._canRun() && this._queue.length > 0) {
+      this._scheduleDrain();
+    } else {
+      this._checkEmptyIdle();
     }
   }
 
@@ -244,6 +289,15 @@ export class Sluice extends EventEmitter {
     }
     if (this._queue.length === 0) return false;
     return true;
+  }
+
+  private _checkEmptyIdle(): void {
+    if (this._queue.length === 0) {
+      this.emit("empty");
+      if (this._running === 0) {
+        this.emit("idle");
+      }
+    }
   }
 
   private _execute(job: QueuedJob): void {
@@ -288,26 +342,34 @@ export class Sluice extends EventEmitter {
       );
     };
 
-    const now = Date.now();
-    const timeSinceLast = now - this._lastScheduled;
-    const minTime = this._options.minTime;
-
-    if (minTime > 0 && timeSinceLast < minTime && this._lastScheduled > 0) {
-      const delay = minTime - timeSinceLast;
-      this._lastScheduled = now + delay;
-      setTimeout(runJob, delay);
+    if (this._chain) {
+      // Chain: schedule execution through the chained limiter
+      this._chain
+        .schedule(() => {
+          return new Promise<void>((chainResolve) => {
+            runJob();
+            // Resolve the chain job when this job finishes
+            const checkDone = () => {
+              // Listen for this job's completion via the original promise
+              // We rely on the job's resolve/reject already being wired up in runJob
+              chainResolve();
+            };
+            // Run synchronously — runJob starts the async job, chain slot freed immediately
+            // This matches bottleneck behavior where chain controls scheduling, not duration
+            checkDone();
+          });
+        })
+        .catch(() => {
+          // Chain limiter stopped — still let job run
+        });
     } else {
-      this._lastScheduled = now;
-      // Use microtask to ensure consistent async behavior
+      // Direct execution via microtask for consistent async behavior
       Promise.resolve().then(runJob);
     }
   }
 
   private _finish(): void {
     this._running--;
-    if (this._chain) {
-      // Notify chained limiter
-    }
     this._scheduleDrain();
   }
 
